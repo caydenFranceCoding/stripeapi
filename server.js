@@ -1,622 +1,326 @@
-// Stripe Checkout Manager for Vibe Beads
-// File: public/script/checkout.js
-
-class CheckoutManager {
-    constructor() {
-        this.isProcessing = false;
-        this.cartItems = [];
-        this.stripe = null;
-        this.elements = null;
-        this.cardElement = null;
-        this.isStripeInitialized = false;
-        this.retryCount = 0;
-        this.maxRetries = 3;
-        this.requestTimeout = 15000;
-        this.sessionId = this.generateSessionId();
-        this.apiBaseUrl = this.getApiBaseUrl();
-        this.stripePublishableKey = 'pk_test_51S2xLf9qYhHIIRbLy8ZyGmQw2Z36zQaKl2JeksdwUIqe0Lk5rXgjv9Tb8f38KPHDwHuA3qi5ZcV3FQxaGCQCj80I00SoLS7Ycy';
-    }
-
-    getApiBaseUrl() {
-        // Updated to use your actual Render URL
-        return 'https://stripeapi-5re0.onrender.com';
-    }
-
-    generateSessionId() {
-        return `s_${Date.now().toString(36)}_${Math.random().toString(36).substr(2, 6)}`;
-    }
-
-    async init() {
-        try {
-            this.loadCartItems();
-            this.renderCartItems();
-            this.updateTotals();
-            this.setupEventListeners();
-
-            this.updateStatus('Initializing payment system...', 'info');
-            await this.initializeStripe();
-
-            window.addEventListener('cartUpdated', (event) => {
-                this.loadCartItems();
-                this.renderCartItems();
-                this.updateTotals();
-            });
-
-            window.addEventListener('beforeunload', (event) => {
-                if (this.isProcessing) {
-                    event.preventDefault();
-                    event.returnValue = 'Payment is being processed. Are you sure you want to leave?';
-                }
-            });
-
-        } catch (error) {
-            console.error('Initialization error:', error);
-            this.handleError('Initialization failed', error);
-        }
-    }
-
-    setupEventListeners() {
-        const completeOrderBtn = document.getElementById('complete-order-btn');
-        if (completeOrderBtn) {
-            completeOrderBtn.replaceWith(completeOrderBtn.cloneNode(true));
-            const newBtn = document.getElementById('complete-order-btn');
-
-            newBtn.addEventListener('click', (event) => {
-                event.preventDefault();
-                this.handleSubmit(event);
-            });
-        }
-
-        document.addEventListener('keydown', (event) => {
-            if (event.key === 'Enter' && event.target.form && !this.isProcessing) {
-                event.preventDefault();
-                this.handleSubmit(event);
-            }
-        });
-    }
-
-    async initializeStripe() {
-        try {
-            // Load Stripe.js
-            await this.loadStripeJS();
-
-            if (!window.Stripe) {
-                throw new Error('Stripe.js not available');
-            }
-
-            // Initialize Stripe with your publishable key
-            this.stripe = window.Stripe(this.stripePublishableKey);
-
-            // Create Elements
-            this.elements = this.stripe.elements({
-                appearance: {
-                    theme: 'stripe',
-                    variables: {
-                        colorPrimary: '#8B7355',
-                        colorBackground: '#ffffff',
-                        colorText: '#2c2c2c',
-                        colorDanger: '#df1b41',
-                        fontFamily: '"Inter", system-ui, sans-serif',
-                        spacingUnit: '4px',
-                        borderRadius: '8px'
-                    }
-                }
-            });
-
-            // Create card element
-            this.cardElement = this.elements.create('card', {
-                style: {
-                    base: {
-                        fontSize: '16px',
-                        color: '#2c2c2c',
-                        '::placeholder': {
-                            color: '#8B7355',
-                        },
-                    },
-                    invalid: {
-                        color: '#df1b41',
-                        iconColor: '#df1b41'
-                    }
-                },
-                hidePostalCode: false
-            });
-
-            // Mount card element
-            this.cardElement.mount('#card-container');
-
-            // Handle real-time validation errors from the card Element
-            this.cardElement.on('change', ({error}) => {
-                if (error) {
-                    this.showError(error.message);
-                } else {
-                    this.hideError();
-                }
-            });
-
-            this.isStripeInitialized = true;
-            this.updateStatus('Payment system ready', 'success');
-
-        } catch (error) {
-            this.updateStatus(`Stripe initialization failed: ${error.message}`, 'error');
-            this.isStripeInitialized = false;
-            throw error;
-        }
-    }
-
-    async loadStripeJS() {
-        return new Promise((resolve, reject) => {
-            if (window.Stripe) {
-                resolve();
-                return;
-            }
-
-            const script = document.createElement('script');
-            script.src = 'https://js.stripe.com/v3/';
-            script.async = true;
-
-            const timeout = setTimeout(() => {
-                script.remove();
-                reject(new Error('Stripe.js loading timeout'));
-            }, 15000);
-
-            script.onload = () => {
-                clearTimeout(timeout);
-                resolve();
-            };
-
-            script.onerror = () => {
-                clearTimeout(timeout);
-                script.remove();
-                reject(new Error('Failed to load Stripe.js'));
-            };
-
-            document.head.appendChild(script);
-        });
-    }
-
-    async handleSubmit(event) {
-        event.preventDefault();
-
-        if (this.isProcessing) {
-            return;
-        }
-
-        if (this.cartItems.length === 0) {
-            this.showError('Your cart is empty. Please add items before checking out.');
-            return;
-        }
-
-        this.hideError();
-
-        try {
-            const formData = this.getFormData();
-            const validation = this.validateForm(formData);
-
-            if (!validation.valid) {
-                this.showError(validation.message);
-                return;
-            }
-
-            this.setProcessingState(true);
-            const totals = this.updateTotals();
-
-            // Step 1: Create customer if needed
-            const customer = await this.createCustomer(formData);
-
-            // Step 2: Create payment intent
-            const paymentIntent = await this.createPaymentIntent(totals.total, customer.customerId, formData);
-
-            // Step 3: Confirm payment
-            const result = await this.stripe.confirmCardPayment(paymentIntent.clientSecret, {
-                payment_method: {
-                    card: this.cardElement,
-                    billing_details: {
-                        name: `${formData.firstName} ${formData.lastName}`,
-                        email: formData.email,
-                        address: {
-                            line1: formData.address,
-                            city: formData.city,
-                            state: formData.state,
-                            postal_code: formData.zipCode,
-                            country: formData.country || 'US'
-                        }
-                    }
-                }
-            });
-
-            if (result.error) {
-                throw new Error(result.error.message);
-            }
-
-            if (result.paymentIntent.status === 'succeeded') {
-                this.showSuccessPage(result.paymentIntent.id);
-                this.clearCart();
-            }
-
-        } catch (error) {
-            this.handleError('Payment processing failed', error);
-        } finally {
-            this.setProcessingState(false);
-        }
-    }
-
-    async createCustomer(formData) {
-        try {
-            const response = await fetch(`${this.apiBaseUrl}/api/create-customer`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    email: formData.email,
-                    name: `${formData.firstName} ${formData.lastName}`,
-                    metadata: {
-                        session_id: this.sessionId,
-                        checkout_timestamp: new Date().toISOString()
-                    }
-                })
-            });
-
-            if (!response.ok) {
-                // If customer creation fails, try to get existing customer
-                return await this.getExistingCustomer(formData.email);
-            }
-
-            return await response.json();
-        } catch (error) {
-            // Fallback: try to get existing customer
-            try {
-                return await this.getExistingCustomer(formData.email);
-            } catch (fallbackError) {
-                console.warn('Customer operations failed, continuing without customer:', error);
-                return { customerId: null };
-            }
-        }
-    }
-
-    async getExistingCustomer(email) {
-        const response = await fetch(`${this.apiBaseUrl}/api/customer/${encodeURIComponent(email)}`);
-
-        if (!response.ok) {
-            throw new Error('Customer not found');
-        }
-
-        return await response.json();
-    }
-
-    async createPaymentIntent(amount, customerId, formData) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), this.requestTimeout);
-
-        try {
-            const paymentData = {
-                amount: amount,
-                currency: 'usd',
-                metadata: {
-                    session_id: this.sessionId,
-                    customer_name: `${formData.firstName} ${formData.lastName}`,
-                    customer_email: formData.email,
-                    order_items: JSON.stringify(this.cartItems.map(item => ({
-                        name: item.name,
-                        quantity: item.quantity,
-                        price: item.price
-                    })))
-                }
-            };
-
-            const response = await fetch(`${this.apiBaseUrl}/api/create-payment-intent`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(paymentData),
-                signal: controller.signal
-            });
-
-            clearTimeout(timeoutId);
-
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Failed to create payment intent');
-            }
-
-            return await response.json();
-
-        } catch (error) {
-            clearTimeout(timeoutId);
-
-            if (error.name === 'AbortError') {
-                throw new Error('Payment request timed out. Please try again.');
-            }
-
-            throw error;
-        }
-    }
-
-    setProcessingState(processing) {
-        this.isProcessing = processing;
-
-        const elements = {
-            buttonText: document.getElementById('button-text'),
-            buttonSpinner: document.getElementById('button-spinner'),
-            completeBtn: document.getElementById('complete-order-btn')
-        };
-
-        if (elements.buttonText) {
-            elements.buttonText.style.display = processing ? 'none' : 'block';
-        }
-        if (elements.buttonSpinner) {
-            elements.buttonSpinner.style.display = processing ? 'flex' : 'none';
-        }
-        if (elements.completeBtn) {
-            elements.completeBtn.disabled = processing || this.cartItems.length === 0;
-            elements.completeBtn.style.opacity = processing ? '0.7' : '1';
-            elements.completeBtn.style.cursor = processing ? 'not-allowed' : 'pointer';
-        }
-
-        // Disable/enable form inputs
-        document.querySelectorAll('input, select').forEach(input => {
-            if (processing) {
-                input.setAttribute('readonly', 'true');
-                input.style.opacity = '0.7';
-            } else {
-                input.removeAttribute('readonly');
-                input.style.opacity = '1';
-            }
-        });
-    }
-
-    loadCartItems() {
-        try {
-            if (window.cartManager) {
-                this.cartItems = window.cartManager.getItems();
-            } else {
-                const savedCart = localStorage.getItem('vibeBeadsCart');
-                this.cartItems = savedCart ? JSON.parse(savedCart) : [];
-            }
-        } catch (error) {
-            console.warn('Failed to load cart items:', error);
-            this.cartItems = [];
-        }
-    }
-
-    saveCartItems() {
-        try {
-            localStorage.setItem('vibeBeadsCart', JSON.stringify(this.cartItems));
-            if (window.cartManager) {
-                window.cartManager.cart = this.cartItems;
-                window.cartManager.updateCartUI();
-            }
-        } catch (error) {
-            console.warn('Failed to save cart items:', error);
-        }
-    }
-
-    clearCart() {
-        this.cartItems = [];
-        this.saveCartItems();
-        if (window.cartManager) {
-            window.cartManager.clearCart();
-        }
-    }
-
-    renderCartItems() {
-        const cartContainer = document.getElementById('cart-items');
-        if (!cartContainer) return;
-
-        if (this.cartItems.length === 0) {
-            cartContainer.innerHTML = `
-                <div class="empty-cart" role="status">
-                    <p>Your cart is empty</p>
-                    <button onclick="window.location.href='../index.html'" class="continue-shopping-btn">
-                        Continue Shopping
-                    </button>
-                </div>
-            `;
-            return;
-        }
-
-        const itemsHtml = this.cartItems.map((item, index) => this.renderCartItem(item, index)).join('');
-        cartContainer.innerHTML = itemsHtml;
-    }
-
-    renderCartItem(item, index) {
-        const price = parseFloat(item.price) || 0;
-        const quantity = parseInt(item.quantity) || 1;
-        const total = price * quantity;
-
-        return `
-            <div class="cart-item" data-index="${index}" role="listitem">
-                <div class="item-image" aria-hidden="true">${this.escapeHtml(item.image || '🕯️')}</div>
-                <div class="item-details">
-                    <div class="item-name">${this.escapeHtml(item.name || 'Unknown Item')}</div>
-                    <div class="item-price">$${price.toFixed(2)} each</div>
-                    <div class="quantity-controls">
-                        <button onclick="checkoutManager.updateQuantity(${index}, -1)" 
-                                aria-label="Decrease quantity">-</button>
-                        <span aria-label="Quantity">${quantity}</span>
-                        <button onclick="checkoutManager.updateQuantity(${index}, 1)" 
-                                aria-label="Increase quantity">+</button>
-                        <button onclick="checkoutManager.removeItem(${index})" 
-                                class="remove-btn" aria-label="Remove item">Remove</button>
-                    </div>
-                </div>
-                <div class="item-total">$${total.toFixed(2)}</div>
-            </div>
-        `;
-    }
-
-    updateTotals() {
-        const subtotal = this.cartItems.reduce((sum, item) => {
-            return sum + ((parseFloat(item.price) || 0) * (parseInt(item.quantity) || 1));
-        }, 0);
-
-        const shipping = this.cartItems.length > 0 ? 8.99 : 0;
-        const tax = subtotal * 0.08;
-        const total = subtotal + shipping + tax;
-
-        this.updateTotalElements(subtotal, shipping, tax, total);
-
-        return { subtotal, shipping, tax, total };
-    }
-
-    updateTotalElements(subtotal, shipping, tax, total) {
-        const elements = {
-            subtotal: document.getElementById('subtotal'),
-            shipping: document.getElementById('shipping'),
-            tax: document.getElementById('tax'),
-            total: document.getElementById('total'),
-            buttonText: document.getElementById('button-text')
-        };
-
-        if (elements.subtotal) elements.subtotal.textContent = `$${subtotal.toFixed(2)}`;
-        if (elements.shipping) elements.shipping.textContent = `$${shipping.toFixed(2)}`;
-        if (elements.tax) elements.tax.textContent = `$${tax.toFixed(2)}`;
-        if (elements.total) elements.total.textContent = `$${total.toFixed(2)}`;
-        if (elements.buttonText && !this.isProcessing) {
-            elements.buttonText.textContent = `Complete Order - $${total.toFixed(2)}`;
-        }
-    }
-
-    getFormData() {
-        const formData = {};
-        document.querySelectorAll('input, select, textarea').forEach(input => {
-            if (input.name) {
-                formData[input.name] = input.value.trim();
-            }
-        });
-        return formData;
-    }
-
-    validateForm(formData) {
-        const requiredFields = ['email', 'firstName', 'lastName', 'address', 'city', 'state', 'zipCode'];
-        const missingFields = requiredFields.filter(field => !formData[field]);
-
-        if (missingFields.length > 0) {
-            return {
-                valid: false,
-                message: `Please fill in required fields: ${missingFields.join(', ')}`
-            };
-        }
-
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.email)) {
-            return { valid: false, message: 'Please enter a valid email address' };
-        }
-
-        if (formData.zipCode && !/^\d{5}(-\d{4})?$/.test(formData.zipCode)) {
-            return { valid: false, message: 'Please enter a valid ZIP code' };
-        }
-
-        return { valid: true };
-    }
-
-    showError(message) {
-        const errorElement = document.getElementById('error-message');
-        const errorText = document.getElementById('error-text');
-
-        if (errorElement && errorText) {
-            errorText.textContent = this.escapeHtml(message);
-            errorElement.style.display = 'block';
-            errorElement.setAttribute('role', 'alert');
-            errorElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-            setTimeout(() => this.hideError(), 15000);
-        }
-    }
-
-    hideError() {
-        const errorElement = document.getElementById('error-message');
-        if (errorElement) {
-            errorElement.style.display = 'none';
-            errorElement.removeAttribute('role');
-        }
-    }
-
-    showSuccessPage(paymentId) {
-        const checkoutContent = document.getElementById('checkout-content');
-        const successMessage = document.getElementById('success-message');
-        const paymentIdText = document.getElementById('payment-id-text');
-
-        if (checkoutContent) checkoutContent.style.display = 'none';
-        if (successMessage) successMessage.style.display = 'block';
-        if (paymentIdText) paymentIdText.textContent = this.escapeHtml(paymentId);
-
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
-
-    updateStatus(message, type = 'info') {
-        console.log(`Status (${type}):`, message);
-
-        const statusElement = document.getElementById('square-status');
-        if (statusElement) {
-            statusElement.textContent = message;
-            statusElement.className = `square-status status-${type}`;
-
-            if (type === 'success') {
-                setTimeout(() => {
-                    if (statusElement.textContent === message) {
-                        statusElement.textContent = '';
-                        statusElement.className = 'square-status';
-                    }
-                }, 5000);
-            }
-        }
-    }
-
-    handleError(context, error) {
-        console.error(`${context}:`, error);
-        const message = error.message || 'An unexpected error occurred. Please try again.';
-        this.showError(message);
-        this.updateStatus(`Error: ${message}`, 'error');
-    }
-
-    escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-    }
-
-    updateQuantity(index, change) {
-        if (index < 0 || index >= this.cartItems.length) return;
-
-        const newQuantity = Math.max(0, (parseInt(this.cartItems[index].quantity) || 1) + change);
-
-        if (newQuantity === 0) {
-            this.removeItem(index);
-        } else {
-            this.cartItems[index].quantity = newQuantity;
-            this.saveCartItems();
-            this.renderCartItems();
-            this.updateTotals();
-        }
-    }
-
-    removeItem(index) {
-        if (index < 0 || index >= this.cartItems.length) return;
-
-        this.cartItems.splice(index, 1);
-        this.saveCartItems();
-        this.renderCartItems();
-        this.updateTotals();
-
-        if (window.cartManager) {
-            window.cartManager.cart = this.cartItems;
-            window.cartManager.updateCartUI();
-        }
-    }
-}
-
-// Initialize checkout manager
-const checkoutManager = new CheckoutManager();
-
-document.addEventListener('DOMContentLoaded', () => {
-    console.log('DOM loaded, initializing Stripe checkout manager...');
-    checkoutManager.init().then(() => {
-        console.log('Stripe checkout manager initialized successfully');
-    }).catch(error => {
-        console.error('Failed to initialize checkout manager:', error);
-    });
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+require('dotenv').config();
+
+const app = express();
+
+// Security middleware
+app.use(helmet());
+
+// Simplified CORS configuration that should work reliably
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:8080',
+    'https://vibebeads.net',
+    'https://www.vibebeads.net'
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  optionsSuccessStatus: 200 // Some legacy browsers choke on 204
+}));
+
+// Handle preflight requests explicitly
+app.options('*', (req, res) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin);
+  res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Content-Length, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', true);
+  res.sendStatus(200);
 });
 
-// Make methods globally available for onclick handlers
-window.checkoutManager = checkoutManager;
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.'
+});
+app.use('/api/', limiter);
+
+// Stripe webhook middleware (raw body needed for signature verification)
+app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }));
+
+// JSON middleware for other routes
+app.use(express.json({ limit: '10mb' }));
+
+// Initialize Stripe
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
+// Webhook endpoint secret
+const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development',
+    cors_origins: [
+      'http://localhost:3000',
+      'http://localhost:8080', 
+      'https://vibebeads.net',
+      'https://www.vibebeads.net'
+    ]
+  });
+});
+
+// Test CORS endpoint
+app.get('/api/test-cors', (req, res) => {
+  res.json({
+    message: 'CORS is working!',
+    origin: req.headers.origin,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Create payment intent
+app.post('/api/create-payment-intent', async (req, res) => {
+  try {
+    console.log('Create payment intent request from origin:', req.headers.origin);
+    const { amount, currency = 'usd', metadata = {} } = req.body;
+
+    if (!amount || amount < 0.50) {
+      return res.status(400).json({
+        error: 'Invalid amount. Minimum amount is $0.50'
+      });
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(amount * 100), // Convert to cents
+      currency,
+      metadata,
+      automatic_payment_methods: {
+        enabled: true,
+      },
+    });
+
+    res.json({
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id
+    });
+  } catch (error) {
+    console.error('Payment intent creation failed:', error);
+    res.status(500).json({
+      error: 'Failed to create payment intent',
+      message: error.message
+    });
+  }
+});
+
+// Create subscription
+app.post('/api/create-subscription', async (req, res) => {
+  try {
+    const { customerId, priceId, paymentMethodId } = req.body;
+
+    if (!customerId || !priceId) {
+      return res.status(400).json({
+        error: 'Customer ID and Price ID are required'
+      });
+    }
+
+    // Attach payment method to customer if provided
+    if (paymentMethodId) {
+      await stripe.paymentMethods.attach(paymentMethodId, {
+        customer: customerId,
+      });
+
+      await stripe.customers.update(customerId, {
+        invoice_settings: {
+          default_payment_method: paymentMethodId,
+        },
+      });
+    }
+
+    const subscription = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [{ price: priceId }],
+      payment_behavior: 'default_incomplete',
+      expand: ['latest_invoice.payment_intent'],
+    });
+
+    res.json({
+      subscriptionId: subscription.id,
+      clientSecret: subscription.latest_invoice.payment_intent.client_secret,
+    });
+  } catch (error) {
+    console.error('Subscription creation failed:', error);
+    res.status(500).json({
+      error: 'Failed to create subscription',
+      message: error.message
+    });
+  }
+});
+
+// Create customer
+app.post('/api/create-customer', async (req, res) => {
+  try {
+    console.log('Create customer request from origin:', req.headers.origin);
+    const { email, name, metadata = {} } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    const customer = await stripe.customers.create({
+      email,
+      name,
+      metadata,
+    });
+
+    res.json({
+      customerId: customer.id,
+      email: customer.email,
+      name: customer.name
+    });
+  } catch (error) {
+    console.error('Customer creation failed:', error);
+    res.status(500).json({
+      error: 'Failed to create customer',
+      message: error.message
+    });
+  }
+});
+
+// Get customer by email
+app.get('/api/customer/:email', async (req, res) => {
+  try {
+    console.log('Get customer request from origin:', req.headers.origin);
+    const { email } = req.params;
+
+    const customers = await stripe.customers.list({
+      email: email,
+      limit: 1,
+    });
+
+    if (customers.data.length === 0) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customer = customers.data[0];
+    res.json({
+      customerId: customer.id,
+      email: customer.email,
+      name: customer.name,
+      created: customer.created
+    });
+  } catch (error) {
+    console.error('Customer retrieval failed:', error);
+    res.status(500).json({
+      error: 'Failed to retrieve customer',
+      message: error.message
+    });
+  }
+});
+
+// Cancel subscription
+app.post('/api/cancel-subscription', async (req, res) => {
+  try {
+    const { subscriptionId } = req.body;
+
+    if (!subscriptionId) {
+      return res.status(400).json({ error: 'Subscription ID is required' });
+    }
+
+    const subscription = await stripe.subscriptions.update(subscriptionId, {
+      cancel_at_period_end: true,
+    });
+
+    res.json({
+      subscriptionId: subscription.id,
+      cancelAtPeriodEnd: subscription.cancel_at_period_end,
+      currentPeriodEnd: subscription.current_period_end
+    });
+  } catch (error) {
+    console.error('Subscription cancellation failed:', error);
+    res.status(500).json({
+      error: 'Failed to cancel subscription',
+      message: error.message
+    });
+  }
+});
+
+// Stripe webhook handler
+app.post('/api/webhooks/stripe', (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the event
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      console.log('Payment succeeded:', event.data.object.id);
+      // Add your business logic here
+      break;
+
+    case 'payment_intent.payment_failed':
+      console.log('Payment failed:', event.data.object.id);
+      // Add your business logic here
+      break;
+
+    case 'customer.subscription.created':
+      console.log('Subscription created:', event.data.object.id);
+      // Add your business logic here
+      break;
+
+    case 'customer.subscription.updated':
+      console.log('Subscription updated:', event.data.object.id);
+      // Add your business logic here
+      break;
+
+    case 'customer.subscription.deleted':
+      console.log('Subscription deleted:', event.data.object.id);
+      // Add your business logic here
+      break;
+
+    case 'invoice.payment_succeeded':
+      console.log('Invoice payment succeeded:', event.data.object.id);
+      // Add your business logic here
+      break;
+
+    case 'invoice.payment_failed':
+      console.log('Invoice payment failed:', event.data.object.id);
+      // Add your business logic here
+      break;
+
+    default:
+      console.log(`Unhandled event type ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+const PORT = process.env.PORT || 3001;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log('CORS enabled for origins:', [
+    'http://localhost:3000',
+    'http://localhost:8080',
+    'https://vibebeads.net', 
+    'https://www.vibebeads.net'
+  ]);
+});
