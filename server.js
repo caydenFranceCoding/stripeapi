@@ -9,35 +9,28 @@ const app = express();
 // Security middleware
 app.use(helmet());
 
-// CORS configuration - Fixed to allow your production domain
-const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
-    
-    const allowedOrigins = [
-      'http://localhost:3000',
-      'https://vibebeads.net',
-      'https://www.vibebeads.net',
-      process.env.FRONTEND_URL
-    ].filter(Boolean); // Remove any undefined values
-    
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      console.log('Blocked by CORS:', origin);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+// Simplified CORS configuration that should work reliably
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:8080',
+    'https://vibebeads.net',
+    'https://www.vibebeads.net'
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-};
+  optionsSuccessStatus: 200 // Some legacy browsers choke on 204
+}));
 
-app.use(cors(corsOptions));
-
-// Handle preflight requests
-app.options('*', cors(corsOptions));
+// Handle preflight requests explicitly
+app.options('*', (req, res) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin);
+  res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Content-Length, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', true);
+  res.sendStatus(200);
+});
 
 // Rate limiting
 const limiter = rateLimit({
@@ -64,13 +57,29 @@ app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
+    environment: process.env.NODE_ENV || 'development',
+    cors_origins: [
+      'http://localhost:3000',
+      'http://localhost:8080', 
+      'https://vibebeads.net',
+      'https://www.vibebeads.net'
+    ]
+  });
+});
+
+// Test CORS endpoint
+app.get('/api/test-cors', (req, res) => {
+  res.json({
+    message: 'CORS is working!',
+    origin: req.headers.origin,
+    timestamp: new Date().toISOString()
   });
 });
 
 // Create payment intent
 app.post('/api/create-payment-intent', async (req, res) => {
   try {
+    console.log('Create payment intent request from origin:', req.headers.origin);
     const { amount, currency = 'usd', metadata = {} } = req.body;
 
     if (!amount || amount < 0.50) {
@@ -148,6 +157,7 @@ app.post('/api/create-subscription', async (req, res) => {
 // Create customer
 app.post('/api/create-customer', async (req, res) => {
   try {
+    console.log('Create customer request from origin:', req.headers.origin);
     const { email, name, metadata = {} } = req.body;
 
     if (!email) {
@@ -177,6 +187,7 @@ app.post('/api/create-customer', async (req, res) => {
 // Get customer by email
 app.get('/api/customer/:email', async (req, res) => {
   try {
+    console.log('Get customer request from origin:', req.headers.origin);
     const { email } = req.params;
 
     const customers = await stripe.customers.list({
@@ -306,5 +317,10 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log('Allowed CORS origins:', corsOptions.origin);
+  console.log('CORS enabled for origins:', [
+    'http://localhost:3000',
+    'http://localhost:8080',
+    'https://vibebeads.net', 
+    'https://www.vibebeads.net'
+  ]);
 });
